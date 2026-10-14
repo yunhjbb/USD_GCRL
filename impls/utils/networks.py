@@ -162,14 +162,23 @@ class GCActor(nn.Module):
     tanh_squash: bool = False
     state_dependent_std: bool = False
     const_std: bool = True
+    activations: Any = nn.gelu
+    tanh_mean: bool = False
     final_fc_init_scale: float = 1e-2
+    output_kernel_init: Any = None
+    log_std_bias_init: float = 0.0
     gc_encoder: nn.Module = None
 
     def setup(self):
-        self.actor_net = MLP(self.hidden_dims, activate_final=True)
-        self.mean_net = nn.Dense(self.action_dim, kernel_init=default_init(self.final_fc_init_scale))
+        self.actor_net = MLP(self.hidden_dims, activate_final=True, activations=self.activations)
+        output_kernel_init = self.output_kernel_init or default_init(self.final_fc_init_scale)
+        self.mean_net = nn.Dense(self.action_dim, kernel_init=output_kernel_init)
         if self.state_dependent_std:
-            self.log_std_net = nn.Dense(self.action_dim, kernel_init=default_init(self.final_fc_init_scale))
+            self.log_std_net = nn.Dense(
+                self.action_dim,
+                kernel_init=output_kernel_init,
+                bias_init=nn.initializers.constant(self.log_std_bias_init),
+            )
         else:
             if not self.const_std:
                 self.log_stds = self.param('log_stds', nn.initializers.zeros, (self.action_dim,))
@@ -199,6 +208,8 @@ class GCActor(nn.Module):
         outputs = self.actor_net(inputs)
 
         means = self.mean_net(outputs)
+        if self.tanh_mean:
+            means = nn.tanh(means)
         if self.state_dependent_std:
             log_stds = self.log_std_net(outputs)
         else:
@@ -281,13 +292,19 @@ class GCValue(nn.Module):
     hidden_dims: Sequence[int]
     layer_norm: bool = True
     ensemble: bool = True
+    activations: Any = nn.gelu
     gc_encoder: nn.Module = None
 
     def setup(self):
         mlp_module = MLP
         if self.ensemble:
             mlp_module = ensemblize(mlp_module, 2)
-        value_net = mlp_module((*self.hidden_dims, 1), activate_final=False, layer_norm=self.layer_norm)
+        value_net = mlp_module(
+            (*self.hidden_dims, 1),
+            activate_final=False,
+            layer_norm=self.layer_norm,
+            activations=self.activations,
+        )
 
         self.value_net = value_net
 
@@ -547,6 +564,7 @@ class MLPwEncoderValue(nn.Module):
 class LANValue(nn.Module):
     hidden_dims: Sequence[int]
     latent_dim: int
+    geometry: str = 'euclidean'
     layer_norm: bool = True
     state_encoder: nn.Module = None
     goal_encoder: nn.Module = None
@@ -567,8 +585,18 @@ class LANValue(nn.Module):
             phi_s = self.phi_state(observations)
             phi_g = self.phi_goal(goals)
 
-        d = jnp.sum((phi_s - phi_g) ** 2, axis=-1)
-        d = jnp.sqrt(d + 1e-6)
+        if self.geometry == 'euclidean':
+            d = jnp.sum((phi_s - phi_g) ** 2, axis=-1)
+            d = jnp.sqrt(d + 1e-6)
+        elif self.geometry == 'categorical':
+            # KL(q_goal || q_state) gives a directional distance from state to goal.
+            log_q_s = jax.nn.log_softmax(phi_s, axis=-1)
+            log_q_g = jax.nn.log_softmax(phi_g, axis=-1)
+            q_g = jnp.exp(log_q_g)
+            kl = jnp.sum(q_g * (log_q_g - log_q_s), axis=-1)
+            d = jnp.sqrt(2.0 * jnp.maximum(kl, 0.0) + 1e-12)
+        else:
+            raise ValueError(f'Unsupported LAN value geometry: {self.geometry}')
 
         if info:
             return d, phi_s, phi_g

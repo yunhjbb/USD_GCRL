@@ -47,6 +47,8 @@ def evaluate(
     video_frame_skip=3,
     eval_temperature=0,
     eval_gaussian=None,
+    skill_horizon=1,
+    max_episode_steps=None,
 ):
     """Evaluate the agent in the environment.
 
@@ -65,8 +67,11 @@ def evaluate(
         A tuple containing the statistics, trajectories, and rendered videos.
     """
     actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
+    if skill_horizon < 1:
+        raise ValueError('skill_horizon must be at least 1.')
     trajs = []
     stats = defaultdict(list)
+    episode_lengths = []
 
     renders = []
     for i in trange(num_eval_episodes + num_video_episodes):
@@ -78,9 +83,20 @@ def evaluate(
         goal_frame = info.get('goal_rendered')
         done = False
         step = 0
+        skill = None
         render = []
-        while not done:
-            action = actor_fn(observations=observation, goals=goal, temperature=eval_temperature)
+        while not done and (max_episode_steps is None or step < max_episode_steps):
+            if hasattr(agent, 'compute_skill'):
+                if step % skill_horizon == 0:
+                    skill = agent.compute_skill(observation, goal)
+                action = actor_fn(
+                    observations=observation,
+                    goals=goal,
+                    skill=skill,
+                    temperature=eval_temperature,
+                )
+            else:
+                action = actor_fn(observations=observation, goals=goal, temperature=eval_temperature)
             action = np.array(action)
             if not config.get('discrete'):
                 if eval_gaussian is not None:
@@ -110,14 +126,100 @@ def evaluate(
             observation = next_observation
         if i < num_eval_episodes:
             add_to(stats, flatten(info))
+            episode_lengths.append(step)
             trajs.append(traj)
         else:
             renders.append(np.array(render))
 
     for k, v in stats.items():
         stats[k] = np.mean(v)
+    if episode_lengths:
+        stats['episode_length'] = np.mean(episode_lengths)
 
     return stats, trajs, renders
+
+
+def evaluate_skills(agent, env, num_skills=8, eval_temperature=0.0, max_episode_steps=None, seed=0):
+    """Measure skill-conditioned coverage and alignment using evaluation-only rollouts."""
+    rng = np.random.default_rng(seed)
+    latent_dim = agent.config['latent_dim']
+    skills = rng.normal(size=(num_skills, latent_dim)).astype(np.float32)
+    skills /= np.maximum(np.linalg.norm(skills, axis=-1, keepdims=True), 1e-8)
+    actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(seed + 1))
+
+    if max_episode_steps is None:
+        max_episode_steps = getattr(env.spec, 'max_episode_steps', None) or 1000
+
+    intrinsic_returns = []
+    intrinsic_returns_per_step = []
+    alignments = []
+    endpoints = []
+    coverages = []
+    occupied = set()
+    per_skill_metrics = {}
+    for skill_id, skill in enumerate(skills):
+        observation, _ = env.reset(options=dict(task_id=1, render_goal=False))
+        start = np.asarray(observation)
+        state = start
+        total_intrinsic = 0.0
+        states_xy = []
+        skill_occupied = set()
+        done = False
+        for _ in range(max_episode_steps):
+            action = actor_fn(
+                observations=state,
+                skill=skill,
+                temperature=eval_temperature,
+            )
+            action = np.asarray(action)
+            next_state, _, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            reward = agent.compute_intrinsic_reward(state, next_state, skill)
+            total_intrinsic += float(np.asarray(reward))
+            state = next_state
+            if np.asarray(state).shape[-1] >= 2:
+                xy = np.asarray(state)[:2]
+                states_xy.append(xy)
+                cell = tuple(np.floor(xy / 1.0).astype(np.int32))
+                occupied.add(cell)
+                skill_occupied.add(cell)
+            if done:
+                break
+
+        phi_start = agent.representation_network.select('phi')(
+            start
+        )
+        phi_end = agent.representation_network.select('phi')(
+            state
+        )
+        displacement = np.asarray(phi_end - phi_start)
+        alignments.append(float(np.dot(displacement, skill) / max(np.linalg.norm(displacement), 1e-8)))
+        intrinsic_returns.append(total_intrinsic)
+        intrinsic_returns_per_step.append(total_intrinsic / max(len(states_xy), 1))
+        coverages.append(len(skill_occupied))
+        endpoints.append(np.asarray(state)[:2])
+        per_skill_metrics[f'skill_eval/skill_{skill_id:02d}_intrinsic_return'] = float(total_intrinsic)
+        per_skill_metrics[f'skill_eval/skill_{skill_id:02d}_alignment'] = alignments[-1]
+        per_skill_metrics[f'skill_eval/skill_{skill_id:02d}_coverage_bins'] = float(len(skill_occupied))
+
+    endpoint_array = np.asarray(endpoints)
+    if len(endpoint_array) > 1:
+        pairwise = endpoint_array[:, None, :] - endpoint_array[None, :, :]
+        upper = np.triu_indices(len(endpoint_array), k=1)
+        endpoint_diversity = float(np.linalg.norm(pairwise, axis=-1)[upper].mean())
+    else:
+        endpoint_diversity = 0.0
+
+    metrics = {
+        'skill_eval/mean_directional_intrinsic_return': float(np.mean(intrinsic_returns)),
+        'skill_eval/mean_directional_intrinsic_reward_per_step': float(np.mean(intrinsic_returns_per_step)),
+        'skill_eval/mean_directional_alignment': float(np.mean(alignments)),
+        'skill_eval/endpoint_diversity': endpoint_diversity,
+        'skill_eval/mean_skill_coverage_1m_bins': float(np.mean(coverages)),
+        'skill_eval/state_coverage_1m_bins': float(len(occupied)),
+    }
+    metrics.update(per_skill_metrics)
+    return metrics
 
 def visualize(agent, epoch, env, save_dir):
     goals = []

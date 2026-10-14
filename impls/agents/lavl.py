@@ -260,6 +260,7 @@ class LAVLAgent(flax.struct.PyTreeNode):
         value_def = LANValue(
             hidden_dims=config['value_hidden_dims'],
             latent_dim=config['latent_dim'],
+            geometry=config['value_geometry'],
             layer_norm=config['layer_norm'],
             state_encoder=encoders.get('state'),
             goal_encoder=rep_def
@@ -267,6 +268,7 @@ class LAVLAgent(flax.struct.PyTreeNode):
         target_value_def = LANValue(
             hidden_dims=config['value_hidden_dims'],
             latent_dim=config['latent_dim'],
+            geometry=config['value_geometry'],
             layer_norm=config['layer_norm'],
             state_encoder=encoders.get('target_state'),
             goal_encoder=target_rep_def
@@ -335,6 +337,7 @@ def get_config():
             actor_hidden_dims=(512, 512, 512),  # Actor network hidden dimensions.
             value_hidden_dims=(512, 512, 512),  # Value network hidden dimensions.
             latent_dim=64,  # Latent dimension for the quasimetric value function.
+            value_geometry='euclidean',  # LAN geometry ('euclidean' or 'categorical').
             rep_dim=10, # Goal representation dimension.
             layer_norm=True,  # Whether to use layer normalization.
             discount=0.999,  # Discount factor.

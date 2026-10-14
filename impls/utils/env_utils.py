@@ -76,7 +76,7 @@ class FrameStackWrapper(gymnasium.Wrapper):
         return self.get_observation(), reward, terminated, truncated, info
 
 
-def make_env_and_datasets(dataset_name, frame_stack=None):
+def make_env_and_datasets(dataset_name, frame_stack=None, reset_env=True):
     """Make OGBench environment and datasets.
 
     Args:
@@ -94,6 +94,15 @@ def make_env_and_datasets(dataset_name, frame_stack=None):
     if frame_stack is not None:
         env = FrameStackWrapper(env, frame_stack)
 
-    env.reset()
+    if reset_env:
+        env.reset()
 
     return env, train_dataset, val_dataset
+
+
+def make_env_only(dataset_name):
+    """Create the OGBench environment without downloading its offline dataset."""
+    import ogbench
+
+    env = ogbench.make_env_and_datasets(dataset_name, env_only=True)
+    return env

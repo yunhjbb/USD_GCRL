@@ -5,17 +5,19 @@ import time
 from collections import defaultdict
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import tqdm
 import wandb
 from absl import app, flags
 from agents import agents
 from ml_collections import config_flags
-from utils.datasets import Dataset, GCDataset, HGCDataset
-from utils.env_utils import make_env_and_datasets
-from utils.evaluation import evaluate, visualize
+from utils.datasets import Dataset, GCDataset, HGCDataset, OfflineMETRADataset
+from utils.env_utils import make_env_and_datasets, make_env_only
+from utils.evaluation import evaluate, evaluate_skills, visualize
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
+from utils.online_metra import collect_and_update, create_metra_replay_buffer
 
 FLAGS = flags.FLAGS
 
@@ -25,6 +27,7 @@ flags.DEFINE_string('env_name', 'antmaze-large-navigate-v0', 'Environment (datas
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
+flags.DEFINE_bool('eval_only', False, 'Evaluate a restored checkpoint once without training.')
 flags.DEFINE_bool('log_wandb', False, 'Whether to log to Weights & Biases.')
 flags.DEFINE_bool('visualize', False, 'Whether to visualize the value function.')
 
@@ -35,15 +38,20 @@ flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
 
 flags.DEFINE_integer('eval_tasks', None, 'Number of tasks to evaluate (None for all).')
 flags.DEFINE_integer('eval_episodes', 20, 'Number of episodes for each task.')
+flags.DEFINE_integer('eval_max_episode_steps', None, 'Optional evaluation episode horizon.')
 flags.DEFINE_float('eval_temperature', 0, 'Actor temperature for evaluation.')
 flags.DEFINE_float('eval_gaussian', None, 'Action Gaussian noise for evaluation.')
 flags.DEFINE_integer('video_episodes', 1, 'Number of video episodes for each task.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
+flags.DEFINE_integer('skill_eval_horizon', 1, 'Number of evaluation steps to hold a goal-induced skill direction.')
+flags.DEFINE_integer('skill_eval_episodes', 8, 'Number of random skills to evaluate for offline METRA.')
 
 config_flags.DEFINE_config_file('agent', 'agents/lavl.py', lock_config=False)
 
 def main(_):
+    if FLAGS.eval_only and (FLAGS.restore_path is None or FLAGS.restore_epoch is None):
+        raise ValueError('--eval_only requires both --restore_path and --restore_epoch.')
     # Set up logger.
     exp_name_str = get_exp_name(FLAGS.seed)
     if FLAGS.log_wandb:
@@ -57,32 +65,58 @@ def main(_):
 
     # Set up environment and dataset.
     config = FLAGS.agent
-    env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=config['frame_stack'])
-
-    dataset_class = {
-        'GCDataset': GCDataset,
-        'HGCDataset': HGCDataset,
-    }[config['dataset_class']]
-    train_dataset = dataset_class(Dataset.create(**train_dataset), config)
-    if val_dataset is not None:
-        val_dataset = dataset_class(Dataset.create(**val_dataset), config)
+    is_offline_metra = config['agent_name'] == 'offline_metra'
+    is_online_metra = config['agent_name'] == 'online_metra'
+    if is_online_metra:
+        # Online METRA needs only the simulator; do not download/load the OGBench dataset.
+        env = make_env_only(FLAGS.env_name)
+        initial_observation, _ = env.reset(seed=FLAGS.seed)
+        train_dataset = val_dataset = None
+    else:
+        env, train_dataset, val_dataset = make_env_and_datasets(
+            FLAGS.env_name, frame_stack=config['frame_stack'], reset_env=not is_offline_metra
+        )
+        dataset_class = {
+            'GCDataset': GCDataset,
+            'HGCDataset': HGCDataset,
+            'OfflineMETRADataset': OfflineMETRADataset,
+        }[config['dataset_class']]
+        train_dataset = dataset_class(Dataset.create(**train_dataset), config)
+        if val_dataset is not None and not is_offline_metra:
+            val_dataset = dataset_class(Dataset.create(**val_dataset), config)
+        elif is_offline_metra:
+            val_dataset = None
 
     # Initialize agent.
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
 
-    example_batch = train_dataset.sample(1)
-    if config['discrete']:
-        # Fill with the maximum action to let the agent know the action space size.
-        example_batch['actions'] = np.full_like(example_batch['actions'], env.action_space.n - 1)
+    if is_online_metra:
+        if not hasattr(env.action_space, 'low'):
+            raise ValueError('Online METRA currently requires a continuous OGBench action space.')
+        example_observations = np.asarray(initial_observation, dtype=np.float32)[None]
+        example_actions = np.asarray(env.action_space.sample(), dtype=np.float32)[None]
+    else:
+        example_batch = train_dataset.sample(1)
+        if is_offline_metra:
+            example_batch = example_batch['skill']
+        if config['discrete']:
+            # Fill with the maximum action to let the agent know the action space size.
+            example_batch['actions'] = np.full_like(example_batch['actions'], env.action_space.n - 1)
 
     agent_class = agents[config['agent_name']]
-    agent = agent_class.create(
-        FLAGS.seed,
-        example_batch['observations'],
-        example_batch['actions'],
-        config,
-    )
+    if is_online_metra:
+        agent = agent_class.create(FLAGS.seed, example_observations, example_actions, config)
+        replay_buffer = None if FLAGS.eval_only else create_metra_replay_buffer(
+            initial_observation, env.action_space.sample(), config
+        )
+    else:
+        agent = agent_class.create(
+            FLAGS.seed,
+            example_batch['observations'],
+            example_batch['actions'],
+            config,
+        )
 
     # Restore agent.
     if FLAGS.restore_path is not None:
@@ -93,13 +127,31 @@ def main(_):
     eval_logger = CsvLogger(os.path.join(save_dir, 'eval.csv'))
     first_time = time.time()
     last_time = time.time()
-    for i in tqdm.tqdm(range(1, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
-        # Update agent.
-        batch = train_dataset.sample(config['batch_size'])
-        agent, update_info = agent.update(batch)
+    iterations = [0] if FLAGS.eval_only else range(1, FLAGS.train_steps + 1)
+    for i in tqdm.tqdm(iterations, smoothing=0.1, dynamic_ncols=True):
+        # Evaluate a restored checkpoint without taking an optimization step.
+        if not FLAGS.eval_only:
+            if is_online_metra:
+                agent, update_info = collect_and_update(
+                    agent, env, replay_buffer, config,
+                    seed=FLAGS.seed + i * config['traj_batch_size'],
+                )
+            elif is_offline_metra:
+                update_infos = []
+                for _ in range(config['updates_per_step']):
+                    batch = train_dataset.sample(config['batch_size'])
+                    agent, step_info = agent.update(batch)
+                    update_infos.append(step_info)
+                update_info = {
+                    key: jnp.mean(jnp.stack([step_info[key] for step_info in update_infos]))
+                    for key in update_infos[0]
+                }
+            else:
+                batch = train_dataset.sample(config['batch_size'])
+                agent, update_info = agent.update(batch)
 
         # Log metrics.
-        if i % FLAGS.log_interval == 0:
+        if not FLAGS.eval_only and i % FLAGS.log_interval == 0:
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             if val_dataset is not None:
                 val_batch = val_dataset.sample(config['batch_size'])
@@ -113,7 +165,7 @@ def main(_):
             train_logger.log(train_metrics, step=i)
 
         # Evaluate agent.
-        if i % FLAGS.eval_interval == 0:
+        if FLAGS.eval_only or i % FLAGS.eval_interval == 0:
             if FLAGS.eval_on_cpu:
                 eval_agent = jax.device_put(agent, device=jax.devices('cpu')[0])
             else:
@@ -135,9 +187,11 @@ def main(_):
                     video_frame_skip=FLAGS.video_frame_skip,
                     eval_temperature=FLAGS.eval_temperature,
                     eval_gaussian=FLAGS.eval_gaussian,
+                    skill_horizon=FLAGS.skill_eval_horizon,
+                    max_episode_steps=FLAGS.eval_max_episode_steps,
                 )
                 renders.extend(cur_renders)
-                metric_names = ['success']
+                metric_names = ['success', 'episode_length']
                 eval_metrics.update(
                     {f'evaluation/{task_name}_{k}': v for k, v in eval_info.items() if k in metric_names}
                 )
@@ -146,6 +200,17 @@ def main(_):
                         overall_metrics[k].append(v)
             for k, v in overall_metrics.items():
                 eval_metrics[f'evaluation/overall_{k}'] = np.mean(v)
+
+            if is_offline_metra and FLAGS.skill_eval_episodes > 0:
+                eval_metrics.update(
+                    evaluate_skills(
+                        eval_agent,
+                        env,
+                        num_skills=FLAGS.skill_eval_episodes,
+                        eval_temperature=FLAGS.eval_temperature,
+                        seed=FLAGS.seed + i,
+                    )
+                )
 
             if FLAGS.video_episodes > 0:
                 video = get_wandb_video(renders=renders, n_cols=num_tasks)

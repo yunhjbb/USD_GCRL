@@ -404,3 +404,66 @@ class HGCDataset(GCDataset):
                 )
 
         return batch
+
+
+@dataclasses.dataclass
+class OfflineMETRADataset:
+    """Fixed-dataset sampler for offline METRA-style representation and skill updates.
+
+    The input is OGBench's compact dataset. `terminals` identifies the final valid
+    transition of each trajectory; the observation immediately after that
+    transition is still available as a hindsight goal.
+    """
+
+    dataset: Dataset
+    config: Any
+
+    def __post_init__(self):
+        self.size = self.dataset.size
+        if 'valids' in self.dataset:
+            self.valid_idxs = np.flatnonzero(self.dataset['valids'] > 0)
+        else:
+            self.valid_idxs = np.arange(self.size)
+
+        terminal_idxs = np.flatnonzero(self.dataset['terminals'] > 0)
+        self.terminal_transition_idxs = np.intersect1d(terminal_idxs, self.valid_idxs)
+        if not len(self.terminal_transition_idxs) or not len(self.valid_idxs):
+            raise ValueError('Offline METRA requires valid transitions and trajectory terminal markers.')
+
+        # OGBench compact data stores one invalid final observation after each
+        # trajectory, so terminal transition t may use observation t + 1 as a goal.
+        end_positions = np.searchsorted(self.terminal_transition_idxs, self.valid_idxs, side='left')
+        if np.any(end_positions >= len(self.terminal_transition_idxs)):
+            raise ValueError('Could not map every valid transition to a trajectory end.')
+        self.goal_end_idxs = self.terminal_transition_idxs[end_positions] + 1
+        if 'valids' not in self.dataset:
+            self.goal_end_idxs = np.minimum(self.goal_end_idxs, self.size - 1)
+
+        self.min_future_gap = int(self.config.get('min_future_gap', 1))
+        if self.min_future_gap < 1:
+            raise ValueError('min_future_gap must be at least 1.')
+        eligible = self.valid_idxs + self.min_future_gap <= self.goal_end_idxs
+        self.rep_idxs = self.valid_idxs[eligible]
+        self.rep_goal_end_idxs = self.goal_end_idxs[eligible]
+        if not len(self.rep_idxs):
+            raise ValueError('No transitions have a future goal at the configured min_future_gap.')
+
+    def _sample_transition_batch(self, idxs):
+        batch = self.dataset.sample(len(idxs), idxs)
+        if 'next_observations' not in batch:
+            batch['next_observations'] = self.dataset['observations'][np.minimum(idxs + 1, self.size - 1)]
+        return batch
+
+    def sample(self, batch_size):
+        """Sample independent representation and skill-learning minibatches."""
+        rep_positions = np.random.randint(len(self.rep_idxs), size=batch_size)
+        rep_idxs = self.rep_idxs[rep_positions]
+        goal_ends = self.rep_goal_end_idxs[rep_positions]
+        goal_lows = rep_idxs + self.min_future_gap
+        goal_idxs = np.random.randint(goal_lows, goal_ends + 1, dtype=np.int64)
+        representation = self._sample_transition_batch(rep_idxs)
+        representation['future_goals'] = self.dataset['observations'][goal_idxs]
+
+        skill_idxs = np.random.choice(self.valid_idxs, size=batch_size, replace=True)
+        skill = self._sample_transition_batch(skill_idxs)
+        return {'representation': representation, 'skill': skill}
