@@ -15,8 +15,9 @@ from ml_collections import config_flags
 from utils.datasets import Dataset, GCDataset, HGCDataset, OfflineMETRADataset
 from utils.env_utils import make_env_and_datasets, make_env_only
 from utils.evaluation import evaluate, evaluate_skills, visualize
-from utils.flax_utils import restore_agent, save_agent
+from utils.flax_utils import restore_agent, save_agent, save_representation
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
+from utils.metra_goal_map import save_metra_goal_map
 from utils.online_metra import collect_and_update, create_metra_replay_buffer
 
 FLAGS = flags.FLAGS
@@ -30,6 +31,8 @@ flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
 flags.DEFINE_bool('eval_only', False, 'Evaluate a restored checkpoint once without training.')
 flags.DEFINE_bool('log_wandb', False, 'Whether to log to Weights & Biases.')
 flags.DEFINE_bool('visualize', False, 'Whether to visualize the value function.')
+flags.DEFINE_bool('metra_goal_map', False, 'Save a METRA representation distance map at each evaluation.')
+flags.DEFINE_bool('save_representation', False, 'Save METRA phi parameters at each evaluation.')
 
 flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
@@ -219,6 +222,10 @@ def main(_):
             if FLAGS.log_wandb:
                 wandb.log(eval_metrics, step=i)
             eval_logger.log(eval_metrics, step=i)
+            if is_online_metra and FLAGS.metra_goal_map:
+                save_metra_goal_map(eval_agent, replay_buffer, save_dir, i, seed=FLAGS.seed)
+            if is_online_metra and FLAGS.save_representation:
+                save_representation(eval_agent, save_dir, i)
 
         if (i % FLAGS.eval_interval == 0) and FLAGS.visualize:
             visualize(agent, i, env, save_dir)

@@ -179,6 +179,24 @@ def save_agent(agent, save_dir, epoch):
     print(f'Saved to {save_path}')
 
 
+def save_representation(agent, save_dir, epoch):
+    """Save only the METRA phi parameters for later goal-map analysis."""
+    save_path = os.path.join(save_dir, f'representation_{epoch}.msgpack')
+    temporary_path = save_path + '.tmp'
+    with open(temporary_path, 'wb') as f:
+        f.write(flax.serialization.to_bytes(agent.representation_network.params))
+    os.replace(temporary_path, save_path)
+    print(f'Saved representation to {save_path}')
+    return save_path
+
+
+def restore_representation(agent, checkpoint_path):
+    """Load a saved phi parameter snapshot into an initialized METRA agent."""
+    with open(checkpoint_path, 'rb') as f:
+        params = flax.serialization.from_bytes(agent.representation_network.params, f.read())
+    return agent.replace(representation_network=agent.representation_network.replace(params=params))
+
+
 def restore_agent(agent, restore_path, restore_epoch):
     """Restore the agent from a file.
 

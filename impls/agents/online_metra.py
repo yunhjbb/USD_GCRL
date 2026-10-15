@@ -226,10 +226,10 @@ class OnlineMETRAAgent(flax.struct.PyTreeNode):
                 tanh_squash=True,
                 state_dependent_std=True,
                 const_std=False,
-                activations=nn.relu,
+                activations=nn.tanh,
                 final_fc_init_scale=1.0,
                 output_kernel_init=nn.initializers.xavier_normal(),
-                log_std_bias_init=1.0,
+                log_std_bias_init=0.0,
             )
         })
         actor_params = actor_def.init(actor_rng, actor=(ex_observations, example_skills))['params']

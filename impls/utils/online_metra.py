@@ -53,20 +53,23 @@ def collect_and_update(agent, env, replay_buffer, config, *, seed):
             action = np.clip(action, env.action_space.low, env.action_space.high)
             next_observation, reward, terminated, truncated, _ = env.step(action)
             episode_length += 1
-            # METRA's max_path_length is a sampler cutoff, not an environment terminal.
-            # Preserve bootstrap at that cutoff; only true environment termination masks Q.
-            done = bool(terminated)
+            # The reference sampler marks the final transition of every path as done.
+            done = bool(terminated or truncated or episode_length >= config['max_episode_steps'])
             next_observation = np.asarray(next_observation, dtype=np.float32)
+            # On an environment terminal, the reference worker keeps its previous
+            # observation as the path's last observation. A sampler cutoff keeps
+            # the actual next observation instead.
+            stored_next_observation = observation if terminated or truncated else next_observation
             replay_buffer.add_transition({
                 'observations': observation,
-                'next_observations': next_observation,
+                'next_observations': stored_next_observation,
                 'actions': action,
                 'skills': skill,
                 'dones': np.asarray(float(done), dtype=np.float32),
             })
             observation = next_observation
             episode_return += float(reward)
-            if terminated or truncated or episode_length >= config['max_episode_steps']:
+            if done:
                 break
 
         rollout_lengths.append(episode_length)
