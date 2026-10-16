@@ -2,7 +2,7 @@
 set -euo pipefail
 
 cuda_device=1
-cuda_requested=false
+cuda_requested=true
 while (($#)); do
   case "$1" in
     --cuda)

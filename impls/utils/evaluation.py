@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 from tqdm import trange
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
 
 def supply_rng(f, rng=jax.random.PRNGKey(0)):
@@ -35,6 +36,69 @@ def add_to(dict_of_lists, single_dict):
     """Append values to the corresponding lists in the dictionary."""
     for k, v in single_dict.items():
         dict_of_lists[k].append(v)
+
+
+def save_failed_eval_trajectories(trajs, env, save_dir, epoch, task_name, task_info=None):
+    """Save XY paths for failed evaluation episodes when observations expose XY."""
+    failed_paths = []
+    for episode, traj in enumerate(trajs):
+        infos = traj.get('info', [])
+        success = infos[-1].get('success', 0.0) if infos else 0.0
+        if float(success) >= 0.5:
+            continue
+        observations = np.asarray(traj.get('observation', []))
+        next_observations = np.asarray(traj.get('next_observation', []))
+        if observations.ndim != 2 or observations.shape[-1] < 2 or next_observations.ndim != 2:
+            continue
+        positions = np.concatenate([observations[:1, :2], next_observations[:, :2]], axis=0)
+        failed_paths.append((episode, positions))
+
+    if not failed_paths:
+        return None
+
+    os.makedirs(save_dir, exist_ok=True)
+    stem = f'eval_failed_paths_step{epoch}_{task_name}'
+    csv_path = os.path.join(save_dir, f'{stem}.csv')
+    with open(csv_path, 'w') as f:
+        f.write('episode,step,x,y\n')
+        for episode, positions in failed_paths:
+            for step, (x, y) in enumerate(positions):
+                f.write(f'{episode},{step},{float(x)},{float(y)}\n')
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    maze = getattr(env.unwrapped, 'maze_map', None)
+    if maze is not None:
+        maze = np.asarray(maze)
+        unit = float(getattr(env.unwrapped, '_maze_unit', 1.0))
+        offset_x = float(getattr(env.unwrapped, '_offset_x', 0.0))
+        offset_y = float(getattr(env.unwrapped, '_offset_y', 0.0))
+        for row, col in np.argwhere(maze == 1):
+            x = col * unit - offset_x
+            y = row * unit - offset_y
+            ax.add_patch(Rectangle((x - unit / 2, y - unit / 2), unit, unit, color='0.2'))
+
+    for episode, positions in failed_paths:
+        ax.plot(positions[:, 0], positions[:, 1], alpha=0.22, linewidth=0.8)
+        ax.scatter(positions[0, 0], positions[0, 1], s=9, color='tab:blue', alpha=0.5)
+        ax.scatter(positions[-1, 0], positions[-1, 1], s=9, color='tab:red', alpha=0.5)
+    if task_info is not None:
+        if 'init_xy' in task_info:
+            ax.scatter(*task_info['init_xy'], marker='o', s=80, color='tab:blue', edgecolors='white', label='start')
+        if 'goal_xy' in task_info:
+            ax.scatter(*task_info['goal_xy'], marker='*', s=150, color='gold', edgecolors='black', label='goal')
+    ax.set_title(f'{task_name}: {len(failed_paths)} failed eval paths at step {epoch}')
+    ax.set_aspect('equal', adjustable='datalim')
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    ax.grid(alpha=0.2)
+    if task_info is not None:
+        ax.legend(loc='best')
+    fig.tight_layout()
+    png_path = os.path.join(save_dir, f'{stem}.png')
+    fig.savefig(png_path, dpi=160)
+    plt.close(fig)
+    print(f'Saved failed evaluation paths to {png_path} and {csv_path}')
+    return png_path
 
 
 def evaluate(

@@ -7,13 +7,13 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 
-def save_metra_goal_map(agent, replay_buffer, save_dir, epoch, seed=0, num_states=2048):
-    """Color replay observations by ||phi(state) - phi(goal)||.
+def save_metra_goal_map(agent, state_source, save_dir, epoch, seed=0, num_states=2048):
+    """Color observed states by ||phi(state) - phi(goal)||.
 
-    The probe is chosen once from actual online observations and reused at every
+    The probe is chosen once from actual observed states and reused at every
     evaluation, so consecutive images show changes in the representation.
     """
-    if replay_buffer is None or replay_buffer.size == 0:
+    if state_source is None or state_source.size == 0:
         return None
 
     probe_path = os.path.join(save_dir, 'metra_goal_map_probe.npz')
@@ -23,8 +23,12 @@ def save_metra_goal_map(agent, replay_buffer, save_dir, epoch, seed=0, num_state
             goal = probe['goal']
     else:
         rng = np.random.default_rng(seed)
-        indices = rng.choice(replay_buffer.size, size=min(num_states, replay_buffer.size), replace=False)
-        observations = np.asarray(replay_buffer['observations'][indices], dtype=np.float32)
+        if hasattr(state_source, 'valid_idxs'):
+            source_indices = np.asarray(state_source.valid_idxs)
+        else:
+            source_indices = np.arange(state_source.size)
+        indices = rng.choice(source_indices, size=min(num_states, len(source_indices)), replace=False)
+        observations = np.asarray(state_source['observations'][indices], dtype=np.float32)
         goal = observations[rng.integers(len(observations))].copy()
         np.savez_compressed(probe_path, observations=observations, goal=goal)
 

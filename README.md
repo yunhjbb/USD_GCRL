@@ -41,23 +41,23 @@ objective and clipped constraint. The three experiment changes are fixed offline
 representation fitting, and IQL in place of SAC. The representation skill is detached during each representation
 gradient update; policy rewards use the current representation directly, without an EMA copy.
 
-Run the AntMaze Giant Navigate experiment from the repository root after activating the Conda environment:
+Run the PointMaze Medium Navigate experiment from the repository root after activating the Conda environment:
 
 ```bash
 bash impls/run_offline_metra.sh
 ```
 
-The script evaluates two tasks with five episodes each every 10,000 updates, without recording videos or running
-random-skill evaluation. Checkpoints are saved every 100,000 updates. `--skill_eval_horizon=1` recomputes the
-goal-induced skill direction each step; set it to a larger integer to hold each direction for that many evaluation
-steps. OGBench exposes episode-end markers without separate timeout labels, so this implementation treats every
-marked end as terminal for the IQL bootstrap mask.
+The script evaluates two tasks with five episodes each every 200 training iterations (10,000 IQL updates), with a
+1,000-step evaluation limit. It saves full checkpoints every 10,000 iterations and representation checkpoints plus
+METRA goal maps at each evaluation. It does not record videos or run random-skill evaluation.
+`--skill_eval_horizon=1` recomputes the goal-induced skill direction each step; set it to a larger integer to hold each
+direction for that many evaluation steps. OGBench exposes episode-end markers without separate timeout labels, so this
+implementation treats every marked end as terminal for the IQL bootstrap mask.
 
-The representation network follows the neighboring METRA implementation's two 1024-unit ReLU layers, 2-D unit
-skills, learning rate `1e-4`, initial multiplier 30, and `1e-3` constraint slack. IQL uses the standard AntMaze
-settings of two 256-unit ReLU layers, learning rate `3e-4`, expectile `0.9`, AWR inverse temperature `10`, discount
-`0.99`, target update `0.005`, batch size 256, and advantage-weight cap 100. This adopts AntMaze IQL's temperature;
-LAVL's AWR temperature of 3 is not used for this AntMaze configuration.
+The representation network uses two 1024-unit ReLU layers and 2-D unit skills. The skill actor uses two 1024-unit
+tanh layers. Representation and IQL learning rates are `1e-4`; the initial multiplier is 30 and constraint slack is
+`1e-3`. IQL keeps expectile `0.9`, AWR inverse temperature `10`, target update `0.005`, batch size 256, and
+advantage-weight cap 100. The discount is `0.999` to match the online experiment.
 
 Evaluation performs real environment rollouts: the agent observes the current state and environment goal, infers a
 skill direction from the learned representation, and executes the IQL actor's actions until the episode ends. The
@@ -67,10 +67,10 @@ training, run from `impls/` and set the checkpoint directory and step:
 ```bash
 python main.py \
   --project=OfflineMETRA-IQL \
-  --env_name=antmaze-giant-navigate-v0 \
+  --env_name=pointmaze-medium-navigate-v0 \
   --agent=agents/offline_metra.py \
   --agent.latent_dim=2 \
-  --restore_path='exp/OfflineMETRA-IQL/antmaze-giant-navigate-v0/YOUR_RUN_NAME' \
+  --restore_path='exp/OfflineMETRA-IQL/pointmaze-medium-navigate-v0/YOUR_RUN_NAME' \
   --restore_epoch=1000000 \
   --eval_only=True \
   --eval_episodes=50 \
@@ -84,7 +84,7 @@ skill=skill, temperature=0)` at each step; `skill` can be recomputed every step 
 
 ## Online METRA on OGBench
 
-`impls/run_online_metra_ogbench.sh` trains a separate online METRA agent directly in the OGBench AntMaze simulator.
+`impls/run_online_metra_ogbench.sh` trains a separate online METRA agent directly in the OGBench PointMaze Medium simulator.
 It creates the simulator without loading or downloading the offline dataset. Each collected episode uses one skill
 sampled uniformly from the unit circle; representation updates use that rollout skill and transition, and the
 skill-conditioned policy is trained with SAC from replay. Network sizes, learning rates, constraint, entropy target,
@@ -93,8 +93,9 @@ implementation and `run_metra_ant.sh`. Set `N_EPOCHS` before launching to shorte
 
 Evaluation infers `normalize(phi(goal) - phi(state))` from the OGBench goal observation and runs the policy
 deterministically. The script evaluates two tasks for five episodes each without video. Training and evaluation use a
-200-step horizon to match METRA's runner; reaching that sampler cutoff bootstraps the critic, while an environment
-termination masks it.
+1,000-step horizon to match the OGBench episode limit; reaching that sampler cutoff bootstraps the critic, while an
+environment termination masks it. Both METRA scripts accept `--cuda N`; the online script defaults to GPU 1 and the
+offline script defaults to GPU 0.
 
 ## Reference
 [1] Park, S., Frans, K., Eysenbach, B., and Levine, S. OGBench: Benchmarking offline goal-conditioned RL. In The Thirteenth International Conference on Learning Representations, 2025.

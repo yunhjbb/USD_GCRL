@@ -113,7 +113,12 @@ class OfflineMETRAAgent(flax.struct.PyTreeNode):
         q2_loss = jnp.mean((q2 - q_target) ** 2)
 
         actor_dist = self.iql_network.select('actor')(observations, skills, params=grad_params)
-        log_prob = actor_dist.log_prob(actions)
+        # OGBench clips dataset actions to [-1, 1]. Tanh policies have open
+        # support (-1, 1), so move boundary actions slightly into the support
+        # before applying the inverse tanh in log_prob.
+        actor_epsilon = self.config['actor_action_epsilon']
+        actor_actions = jnp.clip(actions, -1.0 + actor_epsilon, 1.0 - actor_epsilon)
+        log_prob = actor_dist.log_prob(actor_actions)
         advantage = jax.lax.stop_gradient(target_q - self.iql_network.select('value')(observations, skills))
         log_weight_cap = jnp.log(self.config['max_weight'])
         weights = jnp.exp(jnp.minimum(self.config['awr_beta'] * advantage, log_weight_cap))
@@ -262,10 +267,10 @@ class OfflineMETRAAgent(flax.struct.PyTreeNode):
             tanh_squash=True,
             state_dependent_std=True,
             const_std=False,
-            activations=nn.relu,
+            activations=nn.tanh,
             final_fc_init_scale=1.0,
             output_kernel_init=nn.initializers.xavier_normal(),
-            log_std_bias_init=1.0,
+            log_std_bias_init=0.0,
         )
         iql_modules = {
             'value': value_def,
@@ -321,12 +326,13 @@ def get_config():
             value_hidden_dims=(1024, 1024),
             actor_log_std_min=-13.815510557964274,
             actor_log_std_max=2.0,
+            actor_action_epsilon=1e-6,
             representation_lr=1e-4,
-            iql_lr=3e-4,
+            iql_lr=1e-4,
             lambda_lr=1e-4,
             lambda_init=30.0,
             constraint_epsilon=1e-3,
-            discount=0.99,
+            discount=0.999,
             tau=0.005,
             expectile=0.9,
             awr_beta=10.0,

@@ -14,7 +14,7 @@ from agents import agents
 from ml_collections import config_flags
 from utils.datasets import Dataset, GCDataset, HGCDataset, OfflineMETRADataset
 from utils.env_utils import make_env_and_datasets, make_env_only
-from utils.evaluation import evaluate, evaluate_skills, visualize
+from utils.evaluation import evaluate, evaluate_skills, save_failed_eval_trajectories, visualize
 from utils.flax_utils import restore_agent, save_agent, save_representation
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
 from utils.metra_goal_map import save_metra_goal_map
@@ -33,6 +33,7 @@ flags.DEFINE_bool('log_wandb', False, 'Whether to log to Weights & Biases.')
 flags.DEFINE_bool('visualize', False, 'Whether to visualize the value function.')
 flags.DEFINE_bool('metra_goal_map', False, 'Save a METRA representation distance map at each evaluation.')
 flags.DEFINE_bool('save_representation', False, 'Save METRA phi parameters at each evaluation.')
+flags.DEFINE_bool('save_failed_eval_trajectories', False, 'Plot and save failed evaluation paths when observations contain XY positions.')
 
 flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
@@ -193,6 +194,10 @@ def main(_):
                     skill_horizon=FLAGS.skill_eval_horizon,
                     max_episode_steps=FLAGS.eval_max_episode_steps,
                 )
+                if FLAGS.save_failed_eval_trajectories:
+                    save_failed_eval_trajectories(
+                        trajs, env, save_dir, i, task_name, task_info=task_infos[task_id - 1]
+                    )
                 renders.extend(cur_renders)
                 metric_names = ['success', 'episode_length']
                 eval_metrics.update(
@@ -222,9 +227,10 @@ def main(_):
             if FLAGS.log_wandb:
                 wandb.log(eval_metrics, step=i)
             eval_logger.log(eval_metrics, step=i)
-            if is_online_metra and FLAGS.metra_goal_map:
-                save_metra_goal_map(eval_agent, replay_buffer, save_dir, i, seed=FLAGS.seed)
-            if is_online_metra and FLAGS.save_representation:
+            if (is_online_metra or is_offline_metra) and FLAGS.metra_goal_map:
+                map_source = replay_buffer if is_online_metra else train_dataset.dataset
+                save_metra_goal_map(eval_agent, map_source, save_dir, i, seed=FLAGS.seed)
+            if (is_online_metra or is_offline_metra) and FLAGS.save_representation:
                 save_representation(eval_agent, save_dir, i)
 
         if (i % FLAGS.eval_interval == 0) and FLAGS.visualize:
