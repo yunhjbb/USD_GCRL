@@ -113,6 +113,8 @@ def evaluate(
     eval_gaussian=None,
     skill_horizon=1,
     max_episode_steps=None,
+    planning_candidates=None,
+    planning_recursions=1,
 ):
     """Evaluate the agent in the environment.
 
@@ -133,6 +135,13 @@ def evaluate(
     actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
     if skill_horizon < 1:
         raise ValueError('skill_horizon must be at least 1.')
+    if planning_candidates is not None:
+        if not hasattr(agent, 'representation_network'):
+            raise ValueError('HILP-style planning requires a learned representation.')
+        planning_candidates = jnp.asarray(planning_candidates)
+        planning_candidate_phis = agent.representation_network.select('phi')(planning_candidates)
+    else:
+        planning_candidate_phis = None
     trajs = []
     stats = defaultdict(list)
     episode_lengths = []
@@ -152,7 +161,20 @@ def evaluate(
         while not done and (max_episode_steps is None or step < max_episode_steps):
             if hasattr(agent, 'compute_skill'):
                 if step % skill_horizon == 0:
-                    skill = agent.compute_skill(observation, goal)
+                    if planning_candidate_phis is None:
+                        skill = agent.compute_skill(observation, goal)
+                    else:
+                        phi_s = agent.representation_network.select('phi')(observation)
+                        phi_target = agent.representation_network.select('phi')(goal)
+                        # HILP Algorithm 2: recursively choose a dataset waypoint
+                        # minimizing max(distance(current, waypoint), distance(waypoint, target)).
+                        for _ in range(planning_recursions):
+                            d_start = jnp.linalg.norm(planning_candidate_phis - phi_s, axis=-1)
+                            d_target = jnp.linalg.norm(planning_candidate_phis - phi_target, axis=-1)
+                            waypoint_idx = jnp.argmin(jnp.maximum(d_start, d_target))
+                            phi_target = planning_candidate_phis[waypoint_idx]
+                        direction = phi_target - phi_s
+                        skill = direction / jnp.maximum(jnp.linalg.norm(direction), 1e-6)
                 action = actor_fn(
                     observations=observation,
                     goals=goal,

@@ -5,6 +5,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from agents.offline_metra import (
+    high_level_awr_weights,
+    high_level_directional_advantage,
     intrinsic_reward,
     lagrange_dual_loss,
     normalize,
@@ -15,6 +17,16 @@ from utils.datasets import Dataset, OfflineMETRADataset
 
 
 class OfflineMETRATests(unittest.TestCase):
+    def test_high_level_advantage_and_awr_weights_favor_goal_progress(self):
+        phi_s = jnp.array([[0.0, 0.0], [0.0, 0.0]])
+        phi_goal = jnp.array([[2.0, 0.0], [2.0, 0.0]])
+        phi_subgoal = jnp.array([[1.0, 0.0], [-1.0, 0.0]])
+        advantage = high_level_directional_advantage(phi_s, phi_goal, phi_subgoal)
+        np.testing.assert_allclose(advantage, [1.0, -1.0])
+        weights = high_level_awr_weights(advantage, beta=1.0, max_weight=100.0)
+        self.assertGreater(float(weights[0]), float(weights[1]))
+        np.testing.assert_allclose(jnp.mean(weights), 1.0)
+
     def test_representation_objective_matches_directional_progress_formula(self):
         phi_s = jnp.array([[0.0, 0.0]])
         phi_next = jnp.array([[1.0, 0.0]])
@@ -62,7 +74,7 @@ class OfflineMETRATests(unittest.TestCase):
         skills = sample_unit_sphere(jax.random.PRNGKey(0), 128, 2)
         np.testing.assert_allclose(jnp.linalg.norm(skills, axis=-1), 1.0, atol=1e-6)
 
-    def test_future_goals_stay_in_episode_and_are_strictly_future(self):
+    def test_representation_goals_use_k_steps_or_episode_end(self):
         observations = np.arange(8, dtype=np.float32)[:, None]
         data = Dataset.create(
             observations=observations,
@@ -70,11 +82,17 @@ class OfflineMETRATests(unittest.TestCase):
             terminals=np.array([0, 0, 1, 1, 0, 0, 1, 1], dtype=np.float32),
             valids=np.array([1, 1, 1, 0, 1, 1, 1, 0], dtype=np.float32),
         )
-        sampler = OfflineMETRADataset(data, {'min_future_gap': 1})
+        sampler = OfflineMETRADataset(data, {'rep_future_steps': 2})
         batch = sampler.sample(256)['representation']
         states = batch['observations'][:, 0]
         goals = batch['future_goals'][:, 0]
+        high_goals = batch['high_actor_goals'][:, 0]
+        high_targets = batch['high_actor_targets'][:, 0]
+        episode_ends = np.where(states < 4, 3, 7)
+        np.testing.assert_array_equal(goals, np.minimum(states + 2, episode_ends))
         self.assertTrue(np.all(goals > states))
+        np.testing.assert_array_equal(high_targets, np.minimum(states + 2, high_goals))
+        self.assertTrue(np.all(high_goals > states))
         same_episode = ((states < 4) & (goals < 4)) | ((states >= 4) & (goals >= 4))
         self.assertTrue(np.all(same_episode))
 

@@ -37,7 +37,7 @@ fi
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 python main.py \
-  --project=OfflineMETRA-IQL \
+  --project=OfflineMETRA-IQL-subgoal \
   --seed=0 \
   --env_name=pointmaze-medium-navigate-v0 \
   --train_steps="${N_EPOCHS:-1000000}" \
@@ -57,10 +57,14 @@ python main.py \
   --agent.updates_per_step=50 \
   --agent.latent_dim=2 \
   --agent.representation_hidden_dims='(1024,1024)' \
+  --agent.high_level_hidden_dims='(1024,1024)' \
   --agent.actor_hidden_dims='(1024,1024)' \
   --agent.value_hidden_dims='(1024,1024)' \
   --agent.actor_action_epsilon=1e-6 \
   --agent.representation_lr=1e-4 \
+  --agent.high_level_lr=1e-4 \
+  --agent.high_level_beta=1.0 \
+  --agent.high_level_max_weight=100.0 \
   --agent.iql_lr=1e-4 \
   --agent.lambda_lr=1e-4 \
   --agent.lambda_init=30.0 \
@@ -68,4 +72,4 @@ python main.py \
   --agent.discount=0.999 \
   --agent.expectile=0.9 \
   --agent.awr_beta=10.0 \
-  --agent.min_future_gap=1
+  --agent.rep_future_steps=25

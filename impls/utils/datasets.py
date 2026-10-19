@@ -439,14 +439,16 @@ class OfflineMETRADataset:
         if 'valids' not in self.dataset:
             self.goal_end_idxs = np.minimum(self.goal_end_idxs, self.size - 1)
 
-        self.min_future_gap = int(self.config.get('min_future_gap', 1))
-        if self.min_future_gap < 1:
-            raise ValueError('min_future_gap must be at least 1.')
-        eligible = self.valid_idxs + self.min_future_gap <= self.goal_end_idxs
+        # Use a k-step future state, clamped to the final state of the
+        # trajectory so that transitions near the end still train phi.
+        self.rep_future_steps = int(self.config.get('rep_future_steps', self.config.get('min_future_gap', 1)))
+        if self.rep_future_steps < 1:
+            raise ValueError('rep_future_steps must be at least 1.')
+        eligible = self.valid_idxs < self.goal_end_idxs
         self.rep_idxs = self.valid_idxs[eligible]
         self.rep_goal_end_idxs = self.goal_end_idxs[eligible]
         if not len(self.rep_idxs):
-            raise ValueError('No transitions have a future goal at the configured min_future_gap.')
+            raise ValueError('No transitions have a future state in their trajectory.')
 
     def _sample_transition_batch(self, idxs):
         batch = self.dataset.sample(len(idxs), idxs)
@@ -458,11 +460,15 @@ class OfflineMETRADataset:
         """Sample independent representation and skill-learning minibatches."""
         rep_positions = np.random.randint(len(self.rep_idxs), size=batch_size)
         rep_idxs = self.rep_idxs[rep_positions]
-        goal_ends = self.rep_goal_end_idxs[rep_positions]
-        goal_lows = rep_idxs + self.min_future_gap
-        goal_idxs = np.random.randint(goal_lows, goal_ends + 1, dtype=np.int64)
+        goal_idxs = np.minimum(rep_idxs + self.rep_future_steps, self.rep_goal_end_idxs[rep_positions])
         representation = self._sample_transition_batch(rep_idxs)
         representation['future_goals'] = self.dataset['observations'][goal_idxs]
+        # Teach the high level to predict a reachable local subgoal from a
+        # farther hindsight goal in the same trajectory.
+        high_goal_idxs = np.random.randint(rep_idxs + 1, self.rep_goal_end_idxs[rep_positions] + 1)
+        high_target_idxs = np.minimum(rep_idxs + self.rep_future_steps, high_goal_idxs)
+        representation['high_actor_goals'] = self.dataset['observations'][high_goal_idxs]
+        representation['high_actor_targets'] = self.dataset['observations'][high_target_idxs]
 
         skill_idxs = np.random.choice(self.valid_idxs, size=batch_size, replace=True)
         skill = self._sample_transition_batch(skill_idxs)

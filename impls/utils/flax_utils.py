@@ -214,7 +214,14 @@ def restore_agent(agent, restore_path, restore_epoch):
     with open(restore_path, 'rb') as f:
         load_dict = pickle.load(f)
 
-    agent = flax.serialization.from_state_dict(agent, load_dict['agent'])
+    agent_state = load_dict['agent']
+    if hasattr(agent, 'high_level_network') and 'high_level_network' not in agent_state:
+        # Older offline METRA checkpoints contain phi and IQL, but predate
+        # the high-level subgoal predictor. Initialize only that new module.
+        agent_state = dict(agent_state)
+        agent_state['high_level_network'] = flax.serialization.to_state_dict(agent.high_level_network)
+        print('Initialized high-level subgoal network while restoring an older checkpoint.')
+    agent = flax.serialization.from_state_dict(agent, agent_state)
 
     print(f'Restored from {restore_path}')
 

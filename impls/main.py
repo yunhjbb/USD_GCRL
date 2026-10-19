@@ -29,6 +29,7 @@ flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
 flags.DEFINE_bool('eval_only', False, 'Evaluate a restored checkpoint once without training.')
+flags.DEFINE_bool('resume_training', False, 'Continue training after the restored checkpoint epoch.')
 flags.DEFINE_bool('log_wandb', False, 'Whether to log to Weights & Biases.')
 flags.DEFINE_bool('visualize', False, 'Whether to visualize the value function.')
 flags.DEFINE_bool('metra_goal_map', False, 'Save a METRA representation distance map at each evaluation.')
@@ -50,12 +51,23 @@ flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 flags.DEFINE_integer('skill_eval_horizon', 1, 'Number of evaluation steps to hold a goal-induced skill direction.')
 flags.DEFINE_integer('skill_eval_episodes', 8, 'Number of random skills to evaluate for offline METRA.')
+flags.DEFINE_bool('hilp_test_time_planning', False, 'Use dataset waypoints for HILP-style offline METRA evaluation.')
+flags.DEFINE_integer('planning_num_candidates', 2048, 'Number of offline states sampled as planning waypoints.')
+flags.DEFINE_integer('planning_recursions', 1, 'Number of midpoint refinements used by test-time planning.')
 
 config_flags.DEFINE_config_file('agent', 'agents/lavl.py', lock_config=False)
 
 def main(_):
     if FLAGS.eval_only and (FLAGS.restore_path is None or FLAGS.restore_epoch is None):
         raise ValueError('--eval_only requires both --restore_path and --restore_epoch.')
+    if FLAGS.resume_training and (FLAGS.restore_path is None or FLAGS.restore_epoch is None):
+        raise ValueError('--resume_training requires both --restore_path and --restore_epoch.')
+    if FLAGS.resume_training and FLAGS.eval_only:
+        raise ValueError('--resume_training cannot be combined with --eval_only.')
+    if FLAGS.resume_training and FLAGS.restore_epoch >= FLAGS.train_steps:
+        raise ValueError('--train_steps must be greater than --restore_epoch when resuming.')
+    if FLAGS.planning_num_candidates < 1 or FLAGS.planning_recursions < 1:
+        raise ValueError('Planning candidate count and recursion count must be positive.')
     # Set up logger.
     exp_name_str = get_exp_name(FLAGS.seed)
     if FLAGS.log_wandb:
@@ -131,7 +143,8 @@ def main(_):
     eval_logger = CsvLogger(os.path.join(save_dir, 'eval.csv'))
     first_time = time.time()
     last_time = time.time()
-    iterations = [0] if FLAGS.eval_only else range(1, FLAGS.train_steps + 1)
+    start_iteration = FLAGS.restore_epoch + 1 if FLAGS.resume_training else 1
+    iterations = [0] if FLAGS.eval_only else range(start_iteration, FLAGS.train_steps + 1)
     for i in tqdm.tqdm(iterations, smoothing=0.1, dynamic_ncols=True):
         # Evaluate a restored checkpoint without taking an optimization step.
         if not FLAGS.eval_only:
@@ -193,6 +206,18 @@ def main(_):
                     eval_gaussian=FLAGS.eval_gaussian,
                     skill_horizon=FLAGS.skill_eval_horizon,
                     max_episode_steps=FLAGS.eval_max_episode_steps,
+                    planning_candidates=(
+                        train_dataset.dataset['observations'][
+                            np.random.choice(
+                                train_dataset.size,
+                                size=min(FLAGS.planning_num_candidates, train_dataset.size),
+                                replace=False,
+                            )
+                        ]
+                        if is_offline_metra and FLAGS.hilp_test_time_planning
+                        else None
+                    ),
+                    planning_recursions=FLAGS.planning_recursions,
                 )
                 if FLAGS.save_failed_eval_trajectories:
                     save_failed_eval_trajectories(

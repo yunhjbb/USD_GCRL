@@ -53,6 +53,19 @@ def intrinsic_reward(phi_s, phi_next, skills):
     return jax.lax.stop_gradient(reward)
 
 
+def high_level_directional_advantage(phi_s, phi_goal, phi_subgoal):
+    """First-order goal progress of a dataset subgoal in the current phi space."""
+    goal_direction = normalize(phi_goal - phi_s)
+    return jax.lax.stop_gradient(jnp.sum(goal_direction * (phi_subgoal - phi_s), axis=-1))
+
+
+def high_level_awr_weights(advantage, beta, max_weight):
+    """Normalized AWR weights with a stable capped exponential."""
+    log_weights = jnp.minimum(beta * advantage, jnp.log(max_weight))
+    weights = advantage.shape[0] * jax.nn.softmax(log_weights)
+    return jax.lax.stop_gradient(weights)
+
+
 def lagrange_dual_loss(log_lambda, mean_constraint):
     """METRA's log-parameterized dual loss, minimized by gradient descent."""
     return log_lambda * jax.lax.stop_gradient(mean_constraint)
@@ -66,6 +79,7 @@ def sample_unit_sphere(key, batch_size, latent_dim):
 class OfflineMETRAAgent(flax.struct.PyTreeNode):
     rng: Any
     representation_network: Any
+    high_level_network: Any
     iql_network: Any
     log_lambda: Any
     lambda_opt_state: Any
@@ -89,6 +103,29 @@ class OfflineMETRAAgent(flax.struct.PyTreeNode):
             self.config['constraint_epsilon'],
         )
         return loss, {f'representation/{key}': value for key, value in info.items()}
+
+    def high_level_loss(self, batch, representation_network, grad_params):
+        phi_s = representation_network.select('phi')(batch['observations'])
+        phi_g = representation_network.select('phi')(batch['high_actor_goals'])
+        target = jax.lax.stop_gradient(representation_network.select('phi')(batch['high_actor_targets']))
+        advantage = high_level_directional_advantage(phi_s, phi_g, target)
+        weights = high_level_awr_weights(
+            advantage, self.config['high_level_beta'], self.config['high_level_max_weight']
+        )
+        inputs = jnp.concatenate([batch['observations'], batch['high_actor_goals']], axis=-1)
+        prediction = self.high_level_network.select('subgoal')(inputs, params=grad_params)
+        squared_error = jnp.sum((prediction - target) ** 2, axis=-1)
+        loss = jnp.mean(weights * squared_error)
+        return loss, {
+            'high_level/awr_loss': loss,
+            'high_level/subgoal_mse': jnp.mean(squared_error),
+            'high_level/advantage_mean': jnp.mean(advantage),
+            'high_level/advantage_std': jnp.std(advantage),
+            'high_level/weight_max': jnp.max(weights),
+            'high_level/weight_effective_fraction': (
+                jnp.sum(weights) ** 2 / (len(weights) * jnp.sum(weights**2))
+            ),
+        }
 
     def iql_loss(self, batch, skills, rewards, grad_params):
         observations = batch['observations']
@@ -148,6 +185,9 @@ class OfflineMETRAAgent(flax.struct.PyTreeNode):
         new_representation_network, rep_info = self.representation_network.apply_loss_fn(
             lambda params: self.representation_loss(rep_batch, params)
         )
+        new_high_level_network, high_info = self.high_level_network.apply_loss_fn(
+            lambda params: self.high_level_loss(rep_batch, new_representation_network, params)
+        )
 
         # Match METRA's log-lambda dual update.
         constraint = rep_info['representation/constraint']
@@ -169,6 +209,7 @@ class OfflineMETRAAgent(flax.struct.PyTreeNode):
         new_iql_network = self._update_target_qs(new_iql_network)
 
         info = dict(rep_info)
+        info.update(high_info)
         info.update(iql_info)
         info['representation/lambda'] = jnp.exp(new_log_lambda)
         info['representation/lambda_loss'] = new_log_lambda * constraint
@@ -176,6 +217,7 @@ class OfflineMETRAAgent(flax.struct.PyTreeNode):
         return self.replace(
             rng=new_rng,
             representation_network=new_representation_network,
+            high_level_network=new_high_level_network,
             iql_network=new_iql_network,
             log_lambda=new_log_lambda,
             lambda_opt_state=new_lambda_opt_state,
@@ -194,10 +236,15 @@ class OfflineMETRAAgent(flax.struct.PyTreeNode):
         return network.replace(params=flax.core.freeze(params))
 
     @jax.jit
+    def compute_subgoal_representation(self, observations, goals):
+        inputs = jnp.concatenate([observations, goals], axis=-1)
+        return self.high_level_network.select('subgoal')(inputs)
+
+    @jax.jit
     def compute_skill(self, observations, goals):
         phi_s = self.representation_network.select('phi')(observations)
-        phi_g = self.representation_network.select('phi')(goals)
-        return normalize(phi_g - phi_s)
+        phi_subgoal = self.compute_subgoal_representation(observations, goals)
+        return normalize(phi_subgoal - phi_s)
 
     @jax.jit
     def compute_intrinsic_reward(self, observations, next_observations, skills):
@@ -225,7 +272,7 @@ class OfflineMETRAAgent(flax.struct.PyTreeNode):
     @classmethod
     def create(cls, seed, ex_observations, ex_actions, config):
         rng = jax.random.PRNGKey(seed)
-        rng, rep_rng, iql_rng = jax.random.split(rng, 3)
+        rng, rep_rng, high_rng, iql_rng = jax.random.split(rng, 4)
         latent_dim = config['latent_dim']
         ex_skills = jnp.ones((ex_observations.shape[0], latent_dim), dtype=jnp.float32) / jnp.sqrt(latent_dim)
 
@@ -243,6 +290,22 @@ class OfflineMETRAAgent(flax.struct.PyTreeNode):
             rep_def,
             rep_params,
             tx=optax.adam(config['representation_lr']),
+        )
+
+        high_def = ModuleDict({
+            'subgoal': MLP(
+                (*config['high_level_hidden_dims'], latent_dim),
+                activations=nn.relu,
+                activate_final=False,
+                layer_norm=config['layer_norm'],
+            )
+        })
+        ex_high_inputs = jnp.concatenate([ex_observations, ex_observations], axis=-1)
+        high_params = high_def.init(high_rng, subgoal=(ex_high_inputs,))['params']
+        high_network = TrainState.create(
+            high_def,
+            high_params,
+            tx=optax.adam(config['high_level_lr']),
         )
 
         value_def = GCValue(
@@ -305,6 +368,7 @@ class OfflineMETRAAgent(flax.struct.PyTreeNode):
         return cls(
             rng=rng,
             representation_network=rep_network,
+            high_level_network=high_network,
             iql_network=iql_network,
             log_lambda=log_lambda,
             lambda_opt_state=lambda_tx.init(log_lambda),
@@ -322,12 +386,16 @@ def get_config():
             updates_per_step=50,
             latent_dim=2,
             representation_hidden_dims=(1024, 1024),
+            high_level_hidden_dims=(1024, 1024),
             actor_hidden_dims=(1024, 1024),
             value_hidden_dims=(1024, 1024),
             actor_log_std_min=-13.815510557964274,
             actor_log_std_max=2.0,
             actor_action_epsilon=1e-6,
             representation_lr=1e-4,
+            high_level_lr=1e-4,
+            high_level_beta=1.0,
+            high_level_max_weight=100.0,
             iql_lr=1e-4,
             lambda_lr=1e-4,
             lambda_init=30.0,
@@ -337,7 +405,7 @@ def get_config():
             expectile=0.9,
             awr_beta=10.0,
             max_weight=100.0,
-            min_future_gap=1,
+            rep_future_steps=25,
             layer_norm=False,
             discrete=False,
             encoder=None,
